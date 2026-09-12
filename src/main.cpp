@@ -63,6 +63,8 @@ extern "C" {
 #define PROF_BINNING      8                    // 12x10. binning 2 는 start 가 60ms 를 넘긴다
 #define PROF_EXPOSURE_MS  10
 
+#define USE_CSI_BISECT    1      // 1 = CSI2 로 측거만 시험 (프레임 수신 불가)
+
 #define FRAME_BUF_MAX     15000                // binning 2 기준 14842B
 
 static vl53l9_esp32_dev_t g_dev;
@@ -140,6 +142,17 @@ static void dumpStatus(const char *when) {
                 st.error.spad_supply_overload, st.error.hvboost_limit,
                 st.error.sof_outside_blanking, st.error.pll_lock,
                 st.error.ref_array, st.error.internal_fw);
+  Serial.printf("    laser_driver[0..4] = %02X %02X %02X %02X %02X\n",
+                st.laser_driver[0], st.laser_driver[1], st.laser_driver[2],
+                st.laser_driver[3], st.laser_driver[4]);
+
+  // 온도와 기준 채널 진폭/거리도 본다. REF_ARRAY 에러의 성격을 가른다.
+  uint16_t temp = 0;
+  uint32_t fc = 0;
+  vl53l9_read16(&g_dev, 0x002C, &temp);    // SENSOR_STATUS + 0x04 = TEMPERATURE
+  vl53l9_read32(&g_dev, 0x0028, &fc);      // FRAME_COUNTER
+  Serial.printf("    frame_counter=%lu temperature=%u\n",
+                (unsigned long)fc, temp);
 }
 
 void setup() {
@@ -202,13 +215,23 @@ void setup() {
   // output_interface 뿐 아니라 CSI 관련 필드(data_rate, frame_width/height,
   // virtual_channel, datatype, signaling_mode ...)를 한꺼번에 되쓴다.
   // ST 의 i3c 예제도 이 함수를 호출하지 않는다. 건드리지 않는다.
+  // ---------------------------------------------------------------------
+  // [이분법] 출력 인터페이스를 CSI2 로 바꿔서 측거 파이프라인만 시험한다.
+  //
+  // MIPI 데이터를 받자는 게 아니다. ESP32 에는 CSI 수신기가 없다.
+  // 목적은 "FW 가 폴트를 내는가" 하나다. 프레임 카운터(0x0028)만 본다.
+  //
+  //   폴트 없이 카운터 증가 -> 측거 파이프라인 정상. 문제는 시리얼 출력 한정
+  //   똑같이 internal_fw 폴트 -> 출력 방식과 무관. 측거 자체의 문제
+  // ---------------------------------------------------------------------
   vl53l9_hw_config_t hw;
   STEP(vl53l9_get_hw_config(&g_dev, &hw), "vl53l9_get_hw_config");
-  Serial.printf("    output_interface = %s\n", hw.output_interface ? "I3C(시리얼)" : "CSI2");
-  if (!hw.output_interface) {
-    Serial.println(F("  기본값이 CSI2 다. 이 경로로는 프레임을 못 받는다."));
-    return;
-  }
+  Serial.printf("    output_interface (기본) = %s\n", hw.output_interface ? "I3C(시리얼)" : "CSI2");
+#if USE_CSI_BISECT
+  hw.output_interface = false;   // CSI2
+  STEP(vl53l9_set_hw_config(&g_dev, hw), "vl53l9_set_hw_config (-> CSI2)");
+  Serial.println(F("  ** 이분법 모드: CSI2 로 측거만 시험한다 (프레임 수신 불가) **"));
+#endif
 
   // ---------------------------------------------------------------------
   // [진단] 캘리브레이션 읽기 = PLL + 온칩 캘리브레이션 동시 점검
@@ -296,16 +319,25 @@ void setup() {
 void loop() {
   if (g_frame_size == 0) { delay(2000); return; }
 
-  // ---------------------------------------------------------------------
-  // 측거 구간 완전 무통신 테스트
-  //
-  // ST 예제는 폴링하지 않고 INTR 핀 인터럽트로 기다린다. 즉 측거가 도는
-  // 동안 I2C 버스가 완전히 조용하다. 지금까지 우리는 1~2ms 간격으로
-  // get_status(읽기 9회)를 긁고 있었다. 센서 SoC 가 측거 중 I2C 서비스에
-  // 시달리는 게 원인일 수 있으므로, 트리거 후 버스를 아예 건드리지 않는다.
-  //
-  // frame_period 33ms, exposure 10ms 이므로 200ms 면 충분하고도 남는다.
-  // ---------------------------------------------------------------------
+#if USE_CSI_BISECT
+  // CSI2 모드에서는 프레임을 못 받는다. FW 가 죽는지, 프레임 카운터가
+  // 올라가는지만 본다.
+  uint32_t fc0 = 0, fc1 = 0;
+  vl53l9_read32(&g_dev, 0x0028, &fc0);            // FRAME_COUNTER
+
+  int e = vl53l9_trigger_frame(&g_dev);
+  Serial.printf("trigger_frame -> %s\n", errText(e));
+
+  delay(300);
+
+  vl53l9_read32(&g_dev, 0x0028, &fc1);
+  Serial.printf("  FRAME_COUNTER %lu -> %lu  (증가 %ld)\n",
+                (unsigned long)fc0, (unsigned long)fc1, (long)(fc1 - fc0));
+  dumpStatus("트리거 300ms 후");
+  Serial.println(F("---------------------------------------------------"));
+  delay(1200);
+  return;
+#else
   int e = vl53l9_trigger_frame(&g_dev);
   if (e != VL53L9_ERROR_NONE) {
     Serial.printf("trigger_frame 실패: %s\n", errText(e));
@@ -313,42 +345,27 @@ void loop() {
     delay(2000);
     return;
   }
-
-  delay(200);                      // <-- 이 구간 I2C 트랜잭션 0회
-
+  delay(200);
   dumpStatus("무통신 200ms 후");
-
   uint8_t ready = 0;
   e = vl53l9_poll_frame(&g_dev, &ready);
   Serial.printf("  poll_frame -> %s, ready=%u\n", errText(e), ready);
   if (!ready) { delay(1500); return; }
-
   e = vl53l9_get_frame(&g_dev, g_frame, g_frame_size);
   if (e != VL53L9_ERROR_NONE) {
     Serial.printf("get_frame 실패: %s\n", errText(e));
     delay(1500);
     return;
   }
-
   const uint16_t *depth = (const uint16_t *)g_frame;
-  const uint32_t n = (uint32_t)g_w * g_h;
-  uint16_t mn = 0xFFFF, mx = 0;
-  uint32_t sum = 0, cnt = 0;
-  for (uint32_t i = 0; i < n; i++) {
-    const uint16_t d = depth[i];
-    if (!d) continue;
-    if (d < mn) mn = d;
-    if (d > mx) mx = d;
-    sum += d; cnt++;
-  }
-  Serial.printf("\n--- depth %ux%u | 중앙 %u mm | 최소 %u | 최대 %u | 평균 %lu | 유효 %lu/%lu ---\n",
-                g_w, g_h, depth[(g_h / 2) * g_w + (g_w / 2)],
-                cnt ? mn : 0, mx, cnt ? (unsigned long)(sum / cnt) : 0UL,
-                (unsigned long)cnt, (unsigned long)n);
+  Serial.printf("
+--- depth %ux%u, 중앙 %u mm ---\n",
+                g_w, g_h, depth[(g_h / 2) * g_w + (g_w / 2)]);
   for (uint16_t y = 0; y < g_h; y++) {
     Serial.print("  ");
     for (uint16_t x = 0; x < g_w; x++) Serial.printf("%6u", depth[y * g_w + x]);
     Serial.println();
   }
   delay(1000);
+#endif
 }
