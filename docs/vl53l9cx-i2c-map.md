@@ -415,6 +415,70 @@ temperature = 30
 2. **리워크 열손상** — U4 를 떼면서 같은 보드의 센서 모듈이 열을 받았는지
 3. 정상 보드와 대조
 
+#### 근본 원인: VCSEL 이 발광하지 않는다
+
+프레임 메타데이터 구조체(`vl53l9_utils.h`)는 `SENSOR_STATUS(0x0028)` 영역의
+직접 오버레이다. 레지스터 맵으로 검증된다:
+
+```
+frame_counter  offset 0   = REGADDR_FRAME_COUNTER (base + 0x00)
+temperature    offset 4   = REGADDR_TEMPERATURE   (base + 0x04)
+ldd_temperature offset 6  = REGADDR_LDD_TEMPERATURE (base + 0x06)
+error_code     offset 60  = REGADDR_ERROR_CODE    (base + 0x3C)
+```
+
+따라서 `0x0028` 에서 100바이트를 읽으면 기준 채널 진폭을 직접 볼 수 있다.
+`ref_amplitude` 는 VCSEL 이 쏜 빛을 내부 기준 경로로 받은 세기다.
+
+CSI2 모드에서 프레임 획득 직후 읽은 값:
+
+```
+ref LONG   ch1 amp=0 dist=0   | ch2 amp=0 dist=0
+ref SHORT  ch1 amp=0 dist=149 | ch2 amp=0 dist=149
+temperature=32   ldd_temp=0
+laser_driver[0..4] = 00 00 14 00 00
+frame 12x10   error_code=0x0903  error_status=0xC0
+```
+
+**VCSEL 2채널 모두 기준 진폭이 0이다.** 기준 SPAD 배열이 레이저 빛을 전혀
+받지 못했다. `ref SHORT` 의 `dist=149` 는 진폭이 0 이므로 의미 없는 잡음이다.
+
+그리고 **`ldd_temp = 0`** 인데 같은 프레임에서 센서 다이 온도는 32 도로
+정상 보고된다. 동작 중인 레이저 드라이버가 0 을 보고할 수는 없다.
+
+**결론: 레이저가 켜지지 않는다.** 이것이 `REF_ARRAY_ERROR` 의 원인이고,
+측거가 실패하는 근본 이유다.
+
+반대로 아래는 모두 정상임이 같은 프레임에서 확인된다.
+
+- 디지털/아날로그 코어: 다이 온도 32 도 정상 보고
+- 설정 도달: 메타데이터의 `frame 12x10` 이 우리가 설정한 binning 8 과 일치
+- 파이프라인: 프레임 카운터 증가
+
+#### 확인할 하드웨어 — VBAT_LDD
+
+스키매틱 NOTE 기준 센서 전원은 다음과 같다.
+
+| 핀 | 이름 | 전압 | 용도 |
+|---|---|---|---|
+| B1 | **VBAT_LDD** | **3.3 V** | **레이저 드라이버 전원** |
+| D1 | VBAT_RX | 3.3 V | 수신부 |
+| E6/E7 | AVDD | 2.8 V | SPAD |
+| C12 | DVDD | 1.2 V | 디지털 |
+| E8 | IOVDD | 1.8 V | I/O |
+
+**VBAT_LDD 만 레이저 드라이버 전용이다.** 이 레일이 센서 핀에서 빠져 있으면
+나머지가 전부 정상이어도 레이저만 안 켜진다 — 지금 증상과 정확히 일치한다.
+
+앞서 "3V3/2V8/1V8/1V2 LDO 출력 정상" 을 확인했지만, 그것은 **LDO 출력단**
+측정이었다. LDO 출력과 센서 핀 사이가 끊겨 있을 수 있다.
+
+측정할 곳:
+
+1. **C6 / C7 (P3V3 의 10uF 디커플링 캡)** 양단 전압
+2. 가능하면 센서 **B1(VBAT_LDD), D1(VBAT_RX)** 핀 직접
+3. LDO 출력 -> C6/C7 -> 센서 핀 도통
+
 #### 남은 미지수
 
 **`ERROR_CODE(0x0064) = 0x0F00` 의 의미 하나다.** ST 가 FW 에러 코드표를

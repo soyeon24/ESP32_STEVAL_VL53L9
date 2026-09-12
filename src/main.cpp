@@ -146,13 +146,34 @@ static void dumpStatus(const char *when) {
                 st.laser_driver[0], st.laser_driver[1], st.laser_driver[2],
                 st.laser_driver[3], st.laser_driver[4]);
 
-  // 온도와 기준 채널 진폭/거리도 본다. REF_ARRAY 에러의 성격을 가른다.
-  uint16_t temp = 0;
-  uint32_t fc = 0;
-  vl53l9_read16(&g_dev, 0x002C, &temp);    // SENSOR_STATUS + 0x04 = TEMPERATURE
-  vl53l9_read32(&g_dev, 0x0028, &fc);      // FRAME_COUNTER
-  Serial.printf("    frame_counter=%lu temperature=%u\n",
-                (unsigned long)fc, temp);
+  // ---------------------------------------------------------------------
+  // 상태 라인 100바이트를 통째로 읽어 기준 채널 진폭을 본다.
+  //
+  // vl53l9_utils.h 의 프레임 메타데이터 구조체는 SENSOR_STATUS(0x0028)
+  // 영역의 직접 오버레이다. 레지스터 맵으로 검증됨:
+  //   frame_counter  offset 0    = REGADDR_FRAME_COUNTER (base + 0)
+  //   temperature    offset 4    = REGADDR_TEMPERATURE   (base + 0x04)
+  //   error_code     offset 60   = REGADDR_ERROR_CODE    (base + 0x3C)
+  //
+  // ref_amplitude 는 VCSEL 이 쏜 빛을 내부 기준 경로로 받은 세기다.
+  //   0 에 가까움 -> 레이저가 안 나오거나 기준 경로가 막혔다 (하드웨어)
+  //   유의미한 값 -> 레이저는 나온다. 다른 이유로 REF_ARRAY 가 선 것
+  // ---------------------------------------------------------------------
+  uint8_t sl[100];
+  if (vl53l9_read(&g_dev, 0x0028, sl, sizeof(sl)) != VL53L9_ERROR_NONE) return;
+  #define U16(off) ((uint16_t)(sl[(off)] | ((uint16_t)sl[(off) + 1] << 8)))
+  #define U32(off) ((uint32_t)(sl[(off)] | ((uint32_t)sl[(off)+1] << 8) | \
+                               ((uint32_t)sl[(off)+2] << 16) | ((uint32_t)sl[(off)+3] << 24)))
+  Serial.printf("    frame_counter=%lu  temperature=%u  ldd_temp=%u\n",
+                (unsigned long)U32(0), U16(4), U16(6));
+  Serial.printf("    ref LONG   ch1 amp=%u dist=%u | ch2 amp=%u dist=%u\n",
+                U16(36), U16(38), U16(40), U16(42));
+  Serial.printf("    ref SHORT  ch1 amp=%u dist=%u | ch2 amp=%u dist=%u\n",
+                U16(44), U16(46), U16(48), U16(50));
+  Serial.printf("    frame %ux%u  error_code=0x%04X error_status=0x%02X\n",
+                U16(52), U16(54), U16(60), sl[62]);
+  #undef U16
+  #undef U32
 }
 
 void setup() {
