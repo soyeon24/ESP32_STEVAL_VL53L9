@@ -61,6 +61,10 @@ VL53L5CX/L8CX 관례이고 L9 에는 해당하지 않는다.
 이건 중요하다. `0x1800`~`0x97FF` 가 미매핑 주소의 버스 노이즈였다면 읽을
 때마다 값이 달라졌을 것이다. **안정적 + 고엔트로피 = 실제 저장된 데이터**다.
 
+> **정정(2026-09-12):** 이 결론은 틀렸다. `0x1800` 은 펌웨어 패치가 올라갈
+> 자리이고 패치 설치 전에는 **초기화되지 않은 SRAM** 이다. 전원 인가 후 값이
+> 고정되므로 안정적으로 보였을 뿐이다. 아래 "후기" 절 참고.
+
 ### 매직 넘버 — `0xDC10`
 
 ```
@@ -158,3 +162,122 @@ VL53L5CX 계열이 주소 변경 레지스터를 두는 것과 같은 패턴이�
    `DATA_P/N`, `CLK_P/N`). ESP32 에는 CSI 수신기가 없으므로, 실제 측거까지
    가려면 MIPI 입력이 있는 호스트가 필요하다. ST 가 명시한 지원 플랫폼은
    NUCLEO-N657X0-Q, STM32N6570-DK, Raspberry Pi, Rockchip
+
+---
+
+## 후기: ST 드라이버 확보 후 (2026-09-12)
+
+`STSW-IMG053` / `STSW-IMG054` 를 입수해 대조한 결과, 위 실측 내용이 ST 정본
+레지스터 맵과 일치했다.
+
+| 실측 | ST 정의 |
+|---|---|
+| `0x0000` 이 ID | `VL53L9_REGADDR_MODEL_ID = 0x0000` |
+| `0x1800` 에 32 KB 고엔트로피 | `VL53L9_REGADDR_FWPATCH = 0x1800` (32 kB) |
+| `0xD20B` 에 `0x29` | `VL53L9_REGBASE_SOC_I2C_DEVICEID = 0xD208` |
+
+`vl53l9_get_device_id()` 가 돌려준 값은 `0x53334C39` 로, 실측 바이트열
+`39 4C 33 53` 을 리틀엔디안 32비트로 읽은 것과 정확히 같다.
+
+### 정정: 고엔트로피 블롭은 저장된 데이터가 아니었다
+
+위에서 "안정적 + 고엔트로피 = 실제 저장된 데이터" 라고 썼는데 **틀렸다.**
+
+`0x1800` 은 펌웨어 패치가 올라갈 자리이고, 패치를 설치하기 전에는 **초기화되지
+않은 SRAM** 이다. 전원을 넣으면 값이 고정되므로 재읽기에서도 변하지 않는다.
+`vl53l9_patch.h` 의 실제 패치(9865 바이트)와 대조하니 일치율 0.4% 였다.
+
+같은 `0x1800` 창이 상태에 따라 역할이 바뀐다:
+
+```
+READY_TO_BOOT -> FWPATCH      (32 kB)
+STANDBY       -> FRAME_BUFFER (46 kB)
+STREAMING     -> FB_DEPTH     (46 kB)
+```
+
+### 측거 데이터는 I2C 로 받을 수 있다
+
+이전에 "데이터는 MIPI 로만 나오므로 ESP32 로는 불가능" 이라고 적었는데 이것도
+정정한다. `vl53l9_hw_config_t.output_interface` 가 `false = CSI2`,
+`true = I3C(시리얼)` 이고 **기본값이 I3C** 다. 프레임이 레지스터 공간으로
+나오므로 `0x1800` 에서 읽으면 된다.
+
+프레임 레이아웃 (`vl53l9_get_frame` 기준):
+
+```
+[0        .. res*2)    depth      zone 당 uint16, 리틀엔디안
+[res*2    .. res*4)    amplitude
+[res*4    .. res*6)    ambient
+[res*6    .. +res/2)   DSS LUT 인덱스
+[...      .. +100)     status line
+```
+
+| binning | 해상도 | 존 수 | 프레임 크기 |
+|---|---|---|---|
+| 2 | 54x42 | 2268 | 14842 B |
+| 4 | 24x24 | 576 | 3844 B |
+| 6 | 18x14 | 252 | 1738 B |
+| 8 | 12x10 | 120 | 880 B |
+| 12 | 8x8 | 64 | 516 B |
+| 24 | 4x4 | 16 | 204 B |
+
+### 드라이버 이식성 버그 (ESP32 포팅 중 발견)
+
+`vl53l9.c` 가 `vl53l9_read8()` 로 **enum 지역변수**에 값을 받는 곳이 7군데
+있는데, 그 변수들이 초기화되어 있지 않다.
+
+```c
+static _fsm_state_t _get_fsm_state(void *const p_dev) {
+    _fsm_state_t state;                                 // 미초기화
+    (void)vl53l9_read8(p_dev, ..., (uint8_t *)&state);  // 1바이트만 씀
+    return state;
+}
+```
+
+ARM EABI 는 `-fshort-enums` 가 기본이라 enum 이 1바이트여서 문제가 없다.
+**Xtensa GCC 는 enum 이 4바이트**라 나머지 3바이트가 스택 쓰레기로 남고,
+상태 비교가 영원히 실패한다. `vl53l9_init()` 이 첫 줄
+`_wait_for_state(READY_TO_BOOT)` 에서 타임아웃 나는 원인이었다.
+
+프로젝트 전체에 `-fshort-enums` 를 주는 방법은 ESP-IDF 사전컴파일
+라이브러리와 ABI 가 어긋나므로 쓰지 않았다. 해당 7곳을 0 으로 초기화하는
+최소 수정으로 해결했다 (`lib/vl53l9/vl53l9.c`, `// ESP32 포팅:` 주석).
+
+### 미해결: 측거 시작 시 펌웨어 폴트
+
+여기까지는 동작한다.
+
+```
+vl53l9_init (패치 9865B 설치)   성공
+vl53l9_get_device_id            성공   0x53334C39
+설정 (power/frame_period/context/binning/exposure/sync)  전부 성공
+vl53l9_start                    성공   fsm=0x03(STREAMING), 에러 비트 전부 0
+```
+
+그런데 **실제 측거가 시작되는 순간** 펌웨어가 죽고 STANDBY 로 되돌아간다.
+
+- `SYNC_MANUAL`: start 후 STREAMING 을 유지하다가 첫 `trigger_frame` 에서 폴트
+- `SYNC_AUTONOMOUS`: 자율 모드는 즉시 측거를 시작하므로 start 직후 바로 폴트
+
+트리거 경로의 문제가 아니라 측거 파이프라인이 도는 순간의 문제다.
+
+상태 레지스터는 `internal_fw=1`, `ERROR_CODE(0x0064) = 0x0F00`. 나머지 에러
+비트(vhv_ov / vhv_uv / spad_ovl / hvboost / sof_blank / pll_lock / ref_array)는
+전부 0 이다.
+
+배제한 것:
+
+- `exposure` / `frame_period` / `power_mode` 누락 — 전부 설정해도 동일
+- `set_hw_config` 간섭 — 호출하지 않아도 동일 (기본값이 이미 I3C)
+- `POWER_ULTRA_LOW` — `POWER_REGULAR` 로 바꿔도 동일
+- 폴링 과다 — 폴링에 2ms 간격을 줘도 동일
+- binning 값 — 2 와 8 모두 동일 (binning 2 는 `vl53l9_start` 의 내부
+  타임아웃 60ms 를 넘겨 별도로 타임아웃이 난다)
+
+남은 후보:
+
+1. `ERROR_CODE 0x0F00` 의 의미. ST 가 코드표를 공개하지 않아 디코딩 불가.
+   ST 커뮤니티에 문의하는 게 가장 빠를 수 있다
+2. AP_CLK 품질. Y1 이 SoC 부팅에는 충분해도 측거 파이프라인의 PLL 요구를
+   못 맞출 가능성. `pll_lock` 비트는 0 이지만 FW 가 먼저 죽으면 안 세워질 수 있다
+3. U4(EEPROM) 리워크가 건드렸을 수 있는 회로. 리워크 이력이 있는 보드다
