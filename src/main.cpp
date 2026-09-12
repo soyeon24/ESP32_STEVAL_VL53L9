@@ -19,21 +19,31 @@
 //
 // 전제 조건: R25 제거 / R24 장착 (board_config.h 참고).
 //
-// === 현재 미해결 ===
-// 여기까지는 동작한다: init(패치 설치) / device id / 설정 / start -> STREAMING.
-// 그런데 실제 측거가 시작되는 순간 펌웨어가 죽고 STANDBY 로 되돌아간다.
+// === 현재 미해결: 측거 시작 시 FW 폴트 ===
 //
-//   MANUAL     : start 후 STREAMING 유지 -> 첫 trigger 에서 폴트
-//   AUTONOMOUS : start 직후 바로 폴트 (자율 모드는 즉시 측거를 시작하므로)
+// 동작하는 부분: init(패치 9865B 설치) / device id / 설정 6종 / start -> STREAMING
 //
-// 즉 트리거 경로 문제가 아니라 측거 파이프라인이 도는 순간의 문제다.
-// 상태 레지스터: internal_fw=1, ERROR_CODE=0x0F00. 나머지 에러 비트
-// (vhv/spad/pll_lock/ref_array/ldd)는 전부 0.
+// 그런데 trigger 후 +0ms 에 즉시 폴트가 난다.
 //
-// 배제한 것: exposure/frame_period/power_mode 누락, set_hw_config 간섭,
-//            ULTRA_LOW 전력모드, 폴링 과다, binning 값.
-// 남은 후보: ERROR_CODE 0x0F00 의 의미(ST 미공개), AP_CLK 품질,
-//            U4 리워크가 건드렸을 수 있는 회로.
+//   폴트 포착: trigger +0ms  fsm=0x03(STREAMING)  err=0x80  code=0x0F00
+//
+// err=0x80 은 FW_ERROR(BIT 7) 하나뿐이다. I_LIMIT / VHV_UNDERVOLTAGE /
+// SPAD_SUPPLY_OVERLOAD / PLL_LOCK 은 전부 0 이므로 전원·전류 문제가 아니고,
+// 부하가 걸릴 시간도 없이 즉시 나므로 FW 가 설정 자체를 거부하는 것으로 보인다.
+//
+// 검증한 것 (전부 정상):
+//   - 플랫폼 계층 청크 분할 쓰기: 4096B write/readback 완전 일치
+//   - start 직전 설정 레지스터 읽기: STREAM_STEP_NUMBER=7,
+//     NB_SHOT_STEP 7단계(100/200/400/615/1231/1231/100) 정확,
+//     binning/context/frame_period/sync/output_if 전부 의도대로
+//
+// 바꿔봐도 증상이 동일한 것:
+//   context(SHORT/LONG), binning(2/8), exposure(1/10ms),
+//   power_mode(REGULAR/ULTRA_LOW), sync(MANUAL/AUTONOMOUS), 폴링 간격,
+//   set_hw_config 호출 여부
+//
+// 남은 미지수는 ERROR_CODE 0x0F00 의 의미 하나다. ST 가 코드표를 공개하지
+// 않아 여기서 더 좁힐 수 없다. docs/vl53l9cx-i2c-map.md 참고.
 // ---------------------------------------------------------------------------
 
 #include <Arduino.h>
@@ -43,6 +53,7 @@
 
 extern "C" {
 #include "vl53l9.h"
+#include "vl53l9_platform.h"   // vl53l9_read / vl53l9_write (청크 검증용)
 }
 
 // ST 의 AR_PRECISION 프로파일 값. sync 만 예제와 같이 MANUAL 로 덮어쓴다.
@@ -143,6 +154,39 @@ void setup() {
   Serial.printf("  I2C %lu Hz, SDA=GPIO%d, SCL=GPIO%d, XSHUT=GPIO%d\n",
                 (unsigned long)I2C_FREQ_HZ, PIN_SDA, PIN_SCL, PIN_XSHUT);
 
+  // ---------------------------------------------------------------------
+  // 플랫폼 계층 청크 분할 쓰기 검증
+  //
+  // 펌웨어 패치는 9865바이트이고 Wire 버퍼보다 커서 여러 청크로 쪼개 보낸다.
+  // 이 경로가 미묘하게 틀리면 패치가 손상된 채 올라가고, 부팅은 되지만
+  // 측거 코드가 돌 때 죽는다. init 전에 먼저 확인한다.
+  //
+  // 대상은 0x1800 (패치 영역). 어차피 init 이 곧 덮어쓰므로 안전하다.
+  // ---------------------------------------------------------------------
+  banner("[사전] 청크 쓰기 검증");
+  {
+    const uint32_t N = 4096;                       // 여러 청크에 걸치게
+    static uint8_t tx[4096], rx[4096];
+    for (uint32_t i = 0; i < N; i++) tx[i] = (uint8_t)(i * 7u + 3u);
+
+    int we = vl53l9_write(&g_dev, 0x1800, tx, N);
+    int re = vl53l9_read(&g_dev, 0x1800, rx, N);
+    Serial.printf("  write %lu B -> %d,  read back -> %d\n", (unsigned long)N, we, re);
+
+    uint32_t bad = 0; int32_t first = -1;
+    for (uint32_t i = 0; i < N; i++) {
+      if (tx[i] != rx[i]) { bad++; if (first < 0) first = (int32_t)i; }
+    }
+    if (bad == 0) {
+      Serial.println(F("  일치. 청크 분할 쓰기 정상."));
+    } else {
+      Serial.printf("  !! 불일치 %lu / %lu, 첫 위치 오프셋 %ld (0x%04lX)\n",
+                    (unsigned long)bad, (unsigned long)N,
+                    (long)first, (unsigned long)(0x1800 + first));
+      Serial.printf("     기대 %02X  실제 %02X\n", tx[first], rx[first]);
+    }
+  }
+
   banner("초기화");
 
   // 부팅 + 펌웨어 패치(9865B) 설치
@@ -186,6 +230,29 @@ void setup() {
   Serial.printf("    binning %d -> %ux%u (%u존), 프레임 %u 바이트\n",
                 PROF_BINNING, g_w, g_h, g_w * g_h, g_frame_size);
 
+  // start 전 실제 설정값을 읽어본다. FW 가 +0ms 에 설정을 거부하므로
+  // 무엇이 비어 있는지 보는 게 핵심이다.
+  banner("[진단] start 직전 설정 레지스터");
+  {
+    uint8_t b[0x100];
+    if (vl53l9_read(&g_dev, 0x0460, b, 0xC0) == VL53L9_ERROR_NONE) {
+      for (uint16_t off = 0; off < 0xC0; off += 16) {
+        bool any = false;
+        for (int k = 0; k < 16; k++) if (b[off + k]) { any = true; break; }
+        if (!any) continue;
+        Serial.printf("  %04X  ", 0x0460 + off);
+        for (int k = 0; k < 16; k++) Serial.printf("%02X ", b[off + k]);
+        Serial.println();
+      }
+    }
+    uint8_t sn = 0xAA;
+    vl53l9_read8(&g_dev, 0x04CC, &sn);          // STREAM_STEP_NUMBER (SHORT)
+    Serial.printf("  STREAM_STEP_NUMBER(SHORT, 0x04CC) = %u\n", sn);
+    uint32_t shots0 = 0;
+    vl53l9_read32(&g_dev, 0x0504, &shots0);     // NB_SHOT_STEP(1, SHORT)
+    Serial.printf("  NB_SHOT_STEP(1,SHORT, 0x0504) = %lu\n", (unsigned long)shots0);
+  }
+
   STEP(vl53l9_start(&g_dev), "vl53l9_start");
   delay(100);
   dumpStatus("start 직후");
@@ -202,6 +269,25 @@ void loop() {
     dumpStatus("trigger 실패");
     delay(2000);
     return;
+  }
+
+  // 폴트가 나는 순간을 잡는다. trigger 직후부터 1ms 간격으로 상태를 보면서
+  // fsm 이 STREAMING 을 벗어나거나 에러 비트가 서는 첫 시점을 기록한다.
+  {
+    vl53l9_status_t st;
+    for (int i = 0; i < 60; i++) {
+      if (vl53l9_get_status(&g_dev, &st) != VL53L9_ERROR_NONE) break;
+      const uint8_t *eb = (const uint8_t *)&st.error;
+      if (st.fsm != 3 || *eb != 0) {
+        Serial.printf("\n  폴트 포착: trigger +%dms  fsm=0x%02X err=0x%02X code=0x%04X\n",
+                      i, st.fsm, *eb, st.firmware);
+        Serial.printf("    laser_driver[0..4] = %02X %02X %02X %02X %02X\n",
+                      st.laser_driver[0], st.laser_driver[1], st.laser_driver[2],
+                      st.laser_driver[3], st.laser_driver[4]);
+        break;
+      }
+      delay(1);
+    }
   }
 
   uint8_t ready = 0;

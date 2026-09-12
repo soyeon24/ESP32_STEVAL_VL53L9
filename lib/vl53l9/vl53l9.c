@@ -821,7 +821,7 @@ int vl53l9_get_status(void *const p_dev, vl53l9_status_t *status) {
     ret = vl53l9_read8(p_dev, VL53L9_REGADDR_ERROR_STATUS, (uint8_t *)&status->error);
     CHECK_RET(ret);
     for (uint16_t i = 0U; i < 5U; i++) {
-        ret = vl53l9_read8(p_dev, VL53L9_REGADDR_LDD_STATUS(i), (uint8_t *)status->laser_driver);
+        ret = vl53l9_read8(p_dev, VL53L9_REGADDR_LDD_STATUS(i), &status->laser_driver[i]); // ESP32 포팅 수정: 원본은 항상 [0] 에 써서 나머지 4바이트가 쓰레기로 남는다
         CHECK_RET(ret);
     }
 
@@ -985,7 +985,10 @@ static int _init_default_config(void *const p_dev) {
 
     // set cab_dist_scale according to default context selection (short)
     data = 0x01000800; // short 256 - long 2048
-    return vl53l9_read32(p_dev, VL53L9_REGADDR_CAB_DIST_SCALE, &data);
+    // ESP32 포팅 수정: 원본은 read32 라서 바로 위에서 넣은 값이 덮어써지고
+    // 레지스터가 영영 설정되지 않는다 (주석은 "set" 이라고 되어 있다).
+    // 실측 결과 CAB_DIST_SCALE 이 0 으로 남아 측거 시작 시 FW 가 폴트났다.
+    return vl53l9_write32(p_dev, VL53L9_REGADDR_CAB_DIST_SCALE, data);
 }
 
 static int _is_valid_csi_config(void *const p_dev) {

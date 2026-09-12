@@ -243,6 +243,36 @@ ARM EABI 는 `-fshort-enums` 가 기본이라 enum 이 1바이트여서 문제�
 라이브러리와 ABI 가 어긋나므로 쓰지 않았다. 해당 7곳을 0 으로 초기화하는
 최소 수정으로 해결했다 (`lib/vl53l9/vl53l9.c`, `// ESP32 포팅:` 주석).
 
+### ST 드라이버에서 발견한 버그 3종
+
+포팅 중 `lib/vl53l9/vl53l9.c` 에서 세 가지를 고쳤다. 모두 `// ESP32 포팅` 주석을 달아뒀다.
+
+**1. 미초기화 enum (7곳) — 이식성 버그**
+
+위 "드라이버 이식성 버그" 절 참고. ARM 은 enum 1바이트, Xtensa 는 4바이트.
+`vl53l9_init()` 이 첫 줄에서 타임아웃 나던 원인이었다.
+
+**2. `_init_default_config` 의 `read32` / `write32` 뒤바뀜**
+
+```c
+data = 0x01000800;   // short 256 - long 2048
+return vl53l9_read32(p_dev, VL53L9_REGADDR_CAB_DIST_SCALE, &data);  // <- write32 여야 한다
+```
+
+값을 넣어놓고 읽기를 호출해 `data` 가 즉시 덮어써진다. 주석은 "set" 이라고
+되어 있다. 실측으로 `CAB_DIST_SCALE(0xD524)` 가 `0x00000000` 인 것을 확인했다.
+(이 수정만으로 아래 폴트가 해결되지는 않았지만, 명백한 버그라 유지한다.)
+
+**3. `vl53l9_get_status` 의 LDD 인덱싱**
+
+```c
+for (uint16_t i = 0U; i < 5U; i++)
+    vl53l9_read8(p_dev, VL53L9_REGADDR_LDD_STATUS(i), (uint8_t *)status->laser_driver);
+```
+
+항상 `[0]` 에 쓴다. `&status->laser_driver[i]` 여야 한다. 레이저 드라이버
+상태 5바이트 중 4바이트가 쓰레기로 남는다. 진단에만 영향.
+
 ### 미해결: 측거 시작 시 펌웨어 폴트
 
 여기까지는 동작한다.
@@ -250,34 +280,70 @@ ARM EABI 는 `-fshort-enums` 가 기본이라 enum 이 1바이트여서 문제�
 ```
 vl53l9_init (패치 9865B 설치)   성공
 vl53l9_get_device_id            성공   0x53334C39
-설정 (power/frame_period/context/binning/exposure/sync)  전부 성공
+설정 6종                        전부 성공
 vl53l9_start                    성공   fsm=0x03(STREAMING), 에러 비트 전부 0
 ```
 
-그런데 **실제 측거가 시작되는 순간** 펌웨어가 죽고 STANDBY 로 되돌아간다.
+그런데 trigger 직후 **+0ms 에 즉시** 폴트가 난다.
 
-- `SYNC_MANUAL`: start 후 STREAMING 을 유지하다가 첫 `trigger_frame` 에서 폴트
-- `SYNC_AUTONOMOUS`: 자율 모드는 즉시 측거를 시작하므로 start 직후 바로 폴트
+```
+폴트 포착: trigger +0ms  fsm=0x03(STREAMING)  err=0x80  code=0x0F00
+          laser_driver[0..4] = 00 00 14 00 00
+```
 
-트리거 경로의 문제가 아니라 측거 파이프라인이 도는 순간의 문제다.
+`err=0x80` 은 **`FW_ERROR`(BIT 7) 하나뿐**이다. `I_LIMIT`,
+`VHV_UNDERVOLTAGE`, `VHV_OVERVOLTAGE`, `SPAD_SUPPLY_OVERLOAD`,
+`PLL_LOCK`, `REF_ARRAY`, `SOF_OUTSIDE_BLANKING` 은 전부 0.
 
-상태 레지스터는 `internal_fw=1`, `ERROR_CODE(0x0064) = 0x0F00`. 나머지 에러
-비트(vhv_ov / vhv_uv / spad_ovl / hvboost / sof_blank / pll_lock / ref_array)는
-전부 0 이다.
+**전원·전류 문제가 아니다.** VCSEL 부하가 걸릴 시간조차 없이(+0ms) 나고,
+전류·전압 관련 에러 비트가 하나도 서지 않는다. FW 가 설정 자체를 거부하는
+것으로 보인다.
 
-배제한 것:
+#### 검증해서 정상으로 확인한 것
 
-- `exposure` / `frame_period` / `power_mode` 누락 — 전부 설정해도 동일
-- `set_hw_config` 간섭 — 호출하지 않아도 동일 (기본값이 이미 I3C)
-- `POWER_ULTRA_LOW` — `POWER_REGULAR` 로 바꿔도 동일
-- 폴링 과다 — 폴링에 2ms 간격을 줘도 동일
-- binning 값 — 2 와 8 모두 동일 (binning 2 는 `vl53l9_start` 의 내부
-  타임아웃 60ms 를 넘겨 별도로 타임아웃이 난다)
+**플랫폼 계층 청크 분할 쓰기** — 패치가 Wire 버퍼보다 커서 쪼개 보내는데,
+4096바이트를 쓰고 되읽어 **완전 일치**했다. 패치는 손상되지 않는다.
 
-남은 후보:
+**start 직전 설정 레지스터 실측** —
 
-1. `ERROR_CODE 0x0F00` 의 의미. ST 가 코드표를 공개하지 않아 디코딩 불가.
-   ST 커뮤니티에 문의하는 게 가장 빠를 수 있다
-2. AP_CLK 품질. Y1 이 SoC 부팅에는 충분해도 측거 파이프라인의 PLL 요구를
-   못 맞출 가능성. `pll_lock` 비트는 0 이지만 FW 가 먼저 죽으면 안 세워질 수 있다
-3. U4(EEPROM) 리워크가 건드렸을 수 있는 회로. 리워크 이력이 있는 보드다
+```
+STREAM_STEP_NUMBER(SHORT, 0x04CC) = 7
+NB_SHOT_STEP(1..7, 0x0504~) = 100 / 200 / 400 / 615 / 1231 / 1231 / 100
+0x047A CONTEXT_SELECTION = 00 (SHORT)      0x047C SYNCHRO = 01 (MANUAL)
+0x0480 FRAME_PERIOD = 33333                0x0484 OUTPUT_IF = 01 (I3C)
+0x048C POWER_MODE = 00 (REGULAR)           0x04C4 STANDBY_BINNING = 08
+```
+
+전부 의도한 값이고 비어 있는 항목이 없다.
+
+#### 바꿔도 증상이 같은 것
+
+| 항목 | 시도한 값 |
+|---|---|
+| context | SHORT / LONG |
+| binning | 2 / 8 |
+| exposure | 1 ms / 10 ms |
+| power_mode | REGULAR / ULTRA_LOW |
+| sync | MANUAL / AUTONOMOUS |
+| 폴링 간격 | 0 ms / 2 ms |
+| `set_hw_config` | 호출 / 미호출 |
+
+`SYNC_AUTONOMOUS` 는 자율 모드라 측거를 즉시 시작하므로 `start` 직후 바로
+폴트가 난다. 즉 트리거 경로의 문제가 아니라 **측거 파이프라인이 도는 순간**의
+문제다.
+
+#### 남은 미지수
+
+**`ERROR_CODE(0x0064) = 0x0F00` 의 의미 하나다.** ST 가 FW 에러 코드표를
+공개하지 않아 소프트웨어만으로는 여기서 더 좁힐 수 없다.
+
+재현 조건이 명확하므로 ST 커뮤니티에 문의하는 것이 가장 빠르다. 위 데이터를
+그대로 쓰면 된다.
+
+하드웨어 쪽에서 아직 배제하지 못한 것:
+
+1. **AP_CLK 품질** — Y1 이 SoC 부팅에는 충분해도 측거 파이프라인의 PLL
+   요구를 못 맞출 가능성. `PLL_LOCK` 비트는 0 이지만 FW 가 먼저 죽으면
+   안 세워질 수 있다. Y1 출력에 스코프를 대서 12 MHz 파형을 확인할 것
+2. **U4 리워크** — 이 보드는 EEPROM 을 냉땜으로 떼어낸 이력이 있다.
+   U4 는 모듈 캘리브레이션 데이터를 담고 있었을 수 있다
