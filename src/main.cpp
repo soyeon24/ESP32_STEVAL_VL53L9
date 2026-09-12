@@ -210,6 +210,39 @@ void setup() {
     return;
   }
 
+  // ---------------------------------------------------------------------
+  // [진단] 캘리브레이션 읽기 = PLL + 온칩 캘리브레이션 동시 점검
+  //
+  // get_calib_data 는 내부적으로 COMMAND_SWITCH_TO_FAST_CLOCK 을 보내
+  // PLL 을 켜고 시스템 클럭을 고속으로 바꾼 뒤, OTP 미러 2332바이트를 읽고
+  // 다시 외부 클럭으로 되돌린다. 측거가 쓰는 것과 같은 PLL 이다.
+  //
+  //   실패 -> PLL/클럭 문제. 측거 폴트의 원인일 가능성이 크다
+  //   성공 -> PLL 정상. 캘리브레이션 내용으로 U4 리워크 영향도 볼 수 있다
+  // ---------------------------------------------------------------------
+  banner("[진단] 캘리브레이션 + PLL(고속 클럭 전환)");
+  {
+    static uint8_t calib[VL53L9_CALIB_DATA_SIZE];
+    const int ce = vl53l9_get_calib_data(&g_dev, calib);
+    Serial.printf("  vl53l9_get_calib_data -> %s\n", errText(ce));
+    if (ce == VL53L9_ERROR_NONE) {
+      uint32_t nz = 0, ff = 0;
+      for (uint32_t i = 0; i < VL53L9_CALIB_DATA_SIZE; i++) {
+        if (calib[i]) nz++;
+        if (calib[i] == 0xFF) ff++;
+      }
+      Serial.printf("  %u 바이트 중 non-zero %lu, 0xFF %lu\n",
+                    VL53L9_CALIB_DATA_SIZE, (unsigned long)nz, (unsigned long)ff);
+      Serial.print(F("  앞 32B: "));
+      for (int i = 0; i < 32; i++) Serial.printf("%02X ", calib[i]);
+      Serial.println();
+      if (nz == 0) Serial.println(F("  !! 전부 0. 캘리브레이션이 비어 있다."));
+    } else {
+      Serial.println(F("  !! 실패. 고속 클럭 전환(PLL) 또는 버스트 읽기 문제."));
+    }
+    dumpStatus("calib 직후");
+  }
+
   banner("프로파일 적용 (ST AR_PRECISION)");
 
   STEP(vl53l9_set_power_mode(&g_dev, PROF_POWER),   "vl53l9_set_power_mode (REGULAR)");
