@@ -66,6 +66,62 @@ I am missing.
 0x04C4 STANDBY_BINNING   = 0x08
 ```
 
+## Root cause narrowed: the VCSELs do not emit
+
+Switching `output_interface` to CSI2 (purely as a bisect - the host has no CSI
+receiver, I only read `FRAME_COUNTER` and the error bits) gets much further and
+exposes a different error:
+
+```
+trigger_frame -> OK
+FRAME_COUNTER 0 -> 1                     <- a frame IS acquired
+fsm = 0x02 (STANDBY)   ERROR_CODE = 0x0903
+ERROR_STATUS = 0xC0  ->  FW_ERROR | REF_ARRAY_ERROR
+```
+
+Reading the 100-byte status line at `VL53L9_REGBASE_SENSOR_STATUS` (0x0028),
+which the frame metadata struct overlays directly:
+
+```
+frame_counter = 1     temperature = 32     ldd_temperature = 0
+ref LONG   ch1 amp=0 dist=0     ch2 amp=0 dist=0
+ref SHORT  ch1 amp=0 dist=149   ch2 amp=0 dist=149
+frame 12x10   (matches the configured binning 8)
+LDD_STATUS[0..4] = 00 00 14 00 00
+```
+
+**`ref_amplitude` is 0 on both VCSEL channels in both contexts.** The reference
+SPAD array receives no light at all. `ldd_temperature` reads 0 while the die
+temperature reads a sane 32 C in the same frame.
+
+So the digital core, the configuration path and the ranging pipeline all work -
+the laser simply does not fire.
+
+## Hardware checked
+
+- `VBAT_LDD` / `VBAT_RX` rail (P3V3) measured at C6/C7: **3.3 V, good**
+- AVDD 2.8 V, DVDD 1.2 V, IOVDD 1.8 V: all good
+- PLL: `vl53l9_get_calib_data()` succeeds, so `COMMAND_SWITCH_TO_FAST_CLOCK`
+  works
+- On-chip calibration: 2332 bytes read, 1839 non-zero
+- On-board 12 MHz oscillator in use (R25 removed, R24 fitted)
+
+One observation I cannot interpret: `CAL_TARGET_LD` (0x049C) reads
+**0x0000**, while the adjacent `CAL_RTN_OFFSET` (0x0497) is 0x20. The driver
+never writes `CAL_TARGET_LD`, so I assume it is loaded from OTP at boot. Is 0 a
+valid value here, or does it indicate the laser drive target failed to load?
+
+**Questions:**
+
+1. What does `ERROR_CODE` 0x0903 (and 0x0F00 in I3C output mode) mean?
+2. Is `CAL_TARGET_LD` = 0 expected?
+3. `ref_amplitude` = 0 on both channels with all supplies good - does this
+   indicate a failed part, or is there a configuration step that enables the
+   laser driver that I am missing?
+
+Note: this board has had its EEPROM (U4) desoldered, so heat damage to the
+module cannot be excluded.
+
 ## What I already ruled out
 
 Changing any of these does not change the symptom:
