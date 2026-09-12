@@ -332,6 +332,49 @@ NB_SHOT_STEP(1..7, 0x0504~) = 100 / 200 / 400 / 615 / 1231 / 1231 / 100
 폴트가 난다. 즉 트리거 경로의 문제가 아니라 **측거 파이프라인이 도는 순간**의
 문제다.
 
+#### ST 앱과의 전체 대조 (빠뜨린 단계 없음)
+
+`simple_ranging_i3c/vl53l9_app.c` 를 `platform_power_reset()` 부터 한 줄씩
+대조했다.
+
+| ST | 이 포팅 | |
+|---|---|---|
+| `platform_power_reset` (XSHUT LOW 50ms -> HIGH 50ms) | `enableSensor` (LOW 10ms -> HIGH 200ms) | 동등 |
+| `platform_assign_dynamic_address` (I3C 일 때만) | 스킵 (I2C 라 정당) | OK |
+| `vl53l9_init` | 동일 | OK |
+| `vl53l9_utils_set_profile` 의 6개 호출 | 동일 6개 재현 | OK |
+| `vl53l9_set_sync_mode(MANUAL)` | 동일 | OK |
+| `vl53l9_start` -> `vl53l9_trigger_frame` | 동일 | OK |
+| INTR GPIO 인터럽트 대기 | 폴링 (및 무통신 대기) | 증상 무관 확인 |
+
+레지스터 실측값도 드라이버 의도와 전부 일치한다 (`FORMAT=1(WIDE)`,
+`DSS_MODE=2(SHORT)`, `CONTEXT=0`, `SYNCHRO=1`, `BINNING=8`, shot 7단계).
+**빠진 쓰기가 하나도 없다.**
+
+#### 중요: ST 는 이 조합을 검증한 적이 없다
+
+`interface/vl53l9/vl53l9_device.c` 의 디바이스 기술자:
+
+```c
+#ifdef CONFIG_HW_STEVAL_MIPI          // STEVAL-VL53L9 보드
+      .bus_type = PLATFORM_BUS_I3C | PLATFORM_BUS_CSI,
+      .ext_clock = 12.5e6,            // 호스트가 생성
+#ifdef CONFIG_HW_X_NUCLEO             // X-NUCLEO 쉴드
+      .ext_clock = 12.0e6,            // SW1 = INT (온보드 발진기)
+```
+
+**`simple_ranging_i3c` 예제는 X-NUCLEO 용이다.** STEVAL 항목에는
+`PLATFORM_BUS_CSI` 가 붙어 있고 ST 가 STEVAL 용으로 제공하는 예제는 `_csi`
+쪽뿐이다. 즉 **"STEVAL 보드 + 시리얼(I3C) 프레임 출력"은 ST 가 검증한 적
+없는 조합이다.**
+
+방증: 이 보드의 기본 CSI 프레임 크기가 `108 x 126 = 13608` 인데 binning 2 가
+요구하는 것은 `2268 * 6 + 1134 = 14742` 다. ST 기본값으로는 최대 해상도
+프레임도 담지 못한다.
+
+(참고로 `ext_clock = 12.0e6` 자체는 정당하다. X-NUCLEO 의 온보드 발진기
+설정이 12.0 MHz 이고 그게 shipped default 다.)
+
 #### 남은 미지수
 
 **`ERROR_CODE(0x0064) = 0x0F00` 의 의미 하나다.** ST 가 FW 에러 코드표를

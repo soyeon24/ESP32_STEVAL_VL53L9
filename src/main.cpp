@@ -296,6 +296,16 @@ void setup() {
 void loop() {
   if (g_frame_size == 0) { delay(2000); return; }
 
+  // ---------------------------------------------------------------------
+  // 측거 구간 완전 무통신 테스트
+  //
+  // ST 예제는 폴링하지 않고 INTR 핀 인터럽트로 기다린다. 즉 측거가 도는
+  // 동안 I2C 버스가 완전히 조용하다. 지금까지 우리는 1~2ms 간격으로
+  // get_status(읽기 9회)를 긁고 있었다. 센서 SoC 가 측거 중 I2C 서비스에
+  // 시달리는 게 원인일 수 있으므로, 트리거 후 버스를 아예 건드리지 않는다.
+  //
+  // frame_period 33ms, exposure 10ms 이므로 200ms 면 충분하고도 남는다.
+  // ---------------------------------------------------------------------
   int e = vl53l9_trigger_frame(&g_dev);
   if (e != VL53L9_ERROR_NONE) {
     Serial.printf("trigger_frame 실패: %s\n", errText(e));
@@ -304,75 +314,41 @@ void loop() {
     return;
   }
 
-  // 폴트가 나는 순간을 잡는다. trigger 직후부터 1ms 간격으로 상태를 보면서
-  // fsm 이 STREAMING 을 벗어나거나 에러 비트가 서는 첫 시점을 기록한다.
-  {
-    vl53l9_status_t st;
-    for (int i = 0; i < 60; i++) {
-      if (vl53l9_get_status(&g_dev, &st) != VL53L9_ERROR_NONE) break;
-      const uint8_t *eb = (const uint8_t *)&st.error;
-      if (st.fsm != 3 || *eb != 0) {
-        Serial.printf("\n  폴트 포착: trigger +%dms  fsm=0x%02X err=0x%02X code=0x%04X\n",
-                      i, st.fsm, *eb, st.firmware);
-        Serial.printf("    laser_driver[0..4] = %02X %02X %02X %02X %02X\n",
-                      st.laser_driver[0], st.laser_driver[1], st.laser_driver[2],
-                      st.laser_driver[3], st.laser_driver[4]);
-        break;
-      }
-      delay(1);
-    }
-  }
+  delay(200);                      // <-- 이 구간 I2C 트랜잭션 0회
+
+  dumpStatus("무통신 200ms 후");
 
   uint8_t ready = 0;
-  const uint32_t t0 = millis();
-  // 딜레이 없이 폴링하면 측거 구간 내내 I2C 트랜잭션이 쉴 새 없이 들어가
-  // 센서 SoC 의 내부 타이밍을 방해할 수 있다. 프레임 주기가 33ms 이므로
-  // 2ms 간격이면 충분하다.
-  while (!ready && (millis() - t0) < 2000) {
-    delay(2);
-    if (vl53l9_poll_frame(&g_dev, &ready) != VL53L9_ERROR_NONE) break;
-  }
-  if (!ready) {
-    Serial.println(F("프레임 대기 타임아웃"));
-    dumpStatus("프레임 타임아웃");
-    delay(2000);
-    return;
-  }
+  e = vl53l9_poll_frame(&g_dev, &ready);
+  Serial.printf("  poll_frame -> %s, ready=%u\n", errText(e), ready);
+  if (!ready) { delay(1500); return; }
 
   e = vl53l9_get_frame(&g_dev, g_frame, g_frame_size);
   if (e != VL53L9_ERROR_NONE) {
     Serial.printf("get_frame 실패: %s\n", errText(e));
-    delay(2000);
+    delay(1500);
     return;
   }
 
   const uint16_t *depth = (const uint16_t *)g_frame;
   const uint32_t n = (uint32_t)g_w * g_h;
-
   uint16_t mn = 0xFFFF, mx = 0;
   uint32_t sum = 0, cnt = 0;
   for (uint32_t i = 0; i < n; i++) {
     const uint16_t d = depth[i];
-    if (d == 0) continue;
+    if (!d) continue;
     if (d < mn) mn = d;
     if (d > mx) mx = d;
-    sum += d;
-    cnt++;
+    sum += d; cnt++;
   }
-
   Serial.printf("\n--- depth %ux%u | 중앙 %u mm | 최소 %u | 최대 %u | 평균 %lu | 유효 %lu/%lu ---\n",
                 g_w, g_h, depth[(g_h / 2) * g_w + (g_w / 2)],
                 cnt ? mn : 0, mx, cnt ? (unsigned long)(sum / cnt) : 0UL,
                 (unsigned long)cnt, (unsigned long)n);
-
-  // 54열은 터미널에 너무 넓으므로 가로/세로를 솎아서 보여준다.
-  const uint16_t stepX = (g_w > 18) ? (g_w / 18) : 1;
-  const uint16_t stepY = (g_h > 14) ? (g_h / 14) : 1;
-  for (uint16_t y = 0; y < g_h; y += stepY) {
+  for (uint16_t y = 0; y < g_h; y++) {
     Serial.print("  ");
-    for (uint16_t x = 0; x < g_w; x += stepX) Serial.printf("%6u", depth[y * g_w + x]);
+    for (uint16_t x = 0; x < g_w; x++) Serial.printf("%6u", depth[y * g_w + x]);
     Serial.println();
   }
-
-  delay(500);
+  delay(1000);
 }
