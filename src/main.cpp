@@ -1,25 +1,39 @@
 // ---------------------------------------------------------------------------
-// STEVAL-VL53L9 (VL53L9CX) I2C 버스 진단 스케치
+// VL53L9CX I2C 통신 계층 + 레지스터 맵 탐색
 //
-// 증상: 0x29 로 나간 주소 바이트 직후 9클럭에서 트랜잭션이 끝난다 = 주소 NACK.
-//       (정상이라면 addr-W + reg_hi + reg_lo + ReSTART + addr-R + data = 45클럭)
+// 0x29 응답이 확인됐다 (R25 제거로 Y1 12MHz 활성화 후). 이제 통신 자체를 쓸 수
+// 있게 만든다.
 //
-// 이 스케치가 순서대로 확인하는 것:
-//   [1] SDA/SCL 에 외부 풀업(R7/R8 = 2.2k)이 실제로 붙어 있는가
-//   [2] 버스를 능동적으로 LOW 로 물고 있는 놈이 없는가 (stuck bus)
-//   [3] XSHUT = LOW  상태에서 ACK 하는 주소 목록 (센서를 뺀 나머지. 예: EEPROM)
-//   [4] XSHUT = HIGH 상태에서 ACK 하는 주소 목록
-//       [4] - [3] 의 차집합이 ToF 센서다. 데이터시트 주소를 몰라도 잡힌다.
+// 문제: VL53L9CX 의 레지스터 맵을 모른다. 이전 스케치가 읽던 0x010F 는
+//       VL53L5CX/L8CX 관례에서 가져온 값이고 L9 에 대한 근거가 없다.
+//       실제로 0x00 이 나온다.
+//
+// 그래서 이 스케치는 두 가지를 한다:
+//   1. 재사용 가능한 I2C 읽기/쓰기 API (16-bit 레지스터 주소, 다중 바이트)
+//   2. 맵을 실측으로 찾기 위한 탐색 루틴
+//        [1] 존재 확인
+//        [2] 다중 바이트 읽기가 주소 자동증가를 하는지
+//        [3] 전체 스윕에서 non-zero 영역이 어디인지
+//        [4] 읽을 때마다 값이 변하는 레지스터가 있는지 (살아있는 레지스터 파일)
+//
+// 안전: 이 보드에는 VCSEL 2개와 레이저 드라이버가 있다. 맵을 모르는 상태에서
+//       임의 레지스터에 쓰기를 하면 레이저 구동 설정을 건드릴 수 있다.
+//       tofWrite() 는 API 로 제공하되 이 스케치에서 호출하지 않는다.
 // ---------------------------------------------------------------------------
 
 #include <Arduino.h>
 #include <Wire.h>
 #include "board_config.h"
 
-#define MAX_FOUND 16
+// ESP32 Arduino 코어의 Wire 버퍼는 128바이트. 그보다 작게 잡는다.
+#define CHUNK            32
 
-static uint8_t g_found[MAX_FOUND];   // XSHUT HIGH 에서 마지막으로 찾은 주소들
-static size_t  g_foundCount = 0;
+// 스윕 범위. 필요하면 좁혀서 다시 돌린다.
+#define SWEEP_START      0x0000UL
+#define SWEEP_END        0xFFFFUL
+
+// non-zero 행이 너무 많으면 시리얼이 막힌다. 집계는 전부 하고 출력만 제한.
+#define MAX_PRINT_ROWS   64
 
 static void banner(const char *title) {
   Serial.println();
@@ -30,200 +44,243 @@ static void banner(const char *title) {
 }
 
 // ---------------------------------------------------------------------------
-// [1][2] Wire 가 핀을 가져가기 전에 물리 레벨부터 본다.
+// I2C 통신 계층
 //
-// 세 가지 조건으로 읽어서 라인 상태를 확정한다.
-//   float    : 아무것도 안 걸고 읽기
-//   pull-up  : ESP32 내부 풀업 (약 45k)
-//   pull-down: ESP32 내부 풀다운 (약 45k)
-//
-//   pulldown 에서 HIGH         -> 외부 2.2k 풀업이 45k 를 이김. 배선 정상.
-//   pulldown LOW + pullup HIGH -> 외부 풀업 없음. 선 미연결이거나 다른 핀에 꽂힘.
-//   pulldown LOW + pullup LOW  -> 누가 능동적으로 LOW 로 잡고 있음 (단락/stuck).
+// 반환값 0 = 성공. 그 외는 진단에 쓰라고 원인을 구분해 돌려준다.
+//   1..5  : Wire.endTransmission() 코드 (2=주소 NACK, 3=데이터 NACK, 5=타임아웃)
+//   0xFE  : 요청한 길이만큼 못 받음
+//   0xFD  : 인자 오류
 // ---------------------------------------------------------------------------
-typedef enum { LINE_OK, LINE_NO_PULLUP, LINE_STUCK_LOW } line_state_t;
+static uint8_t tofRead(uint16_t reg, uint8_t *buf, size_t len) {
+  if (!buf || len == 0 || len > CHUNK) return 0xFD;
 
-static line_state_t probeLine(int pin, const char *name) {
-  pinMode(pin, INPUT);
-  delayMicroseconds(500);
-  const int vFloat = digitalRead(pin);
+  Wire.beginTransmission(TOF_I2C_ADDR_7BIT);
+  Wire.write((uint8_t)(reg >> 8));
+  Wire.write((uint8_t)(reg & 0xFF));
+  const uint8_t rc = Wire.endTransmission(false);   // repeated start 유지
+  if (rc != 0) return rc;
 
-  pinMode(pin, INPUT_PULLUP);
-  delayMicroseconds(500);
-  const int vUp = digitalRead(pin);
-
-  pinMode(pin, INPUT_PULLDOWN);
-  delayMicroseconds(500);
-  const int vDown = digitalRead(pin);
-
-  pinMode(pin, INPUT);
-
-  line_state_t st;
-  if (vDown == HIGH)    st = LINE_OK;
-  else if (vUp == HIGH) st = LINE_NO_PULLUP;
-  else                  st = LINE_STUCK_LOW;
-
-  const char *verdict =
-      (st == LINE_OK)        ? "외부 풀업 확인 -> 배선 정상"
-    : (st == LINE_NO_PULLUP) ? "외부 풀업 없음 -> 선 미연결 / 오배선 의심"
-                             : "능동 LOW -> GND 단락 또는 stuck bus";
-
-  Serial.printf("  %-3s (GPIO%02d)  float=%d  pullup=%d  pulldown=%d   %s\n",
-                name, pin, vFloat, vUp, vDown, verdict);
-  return st;
+  const size_t got = Wire.requestFrom((int)TOF_I2C_ADDR_7BIT, (int)len, (int)true);
+  if (got != len) return 0xFE;
+  for (size_t i = 0; i < len; i++) buf[i] = Wire.read();
+  return 0;
 }
 
-// SDA 가 물려 있을 때 SCL 을 9번 때려서 슬레이브를 풀어주는 표준 복구 루틴.
-static void recoverBus() {
-  Serial.println(F("  -> SDA stuck. SCL 9클럭 + STOP 으로 복구 시도"));
-  pinMode(PIN_SCL, OUTPUT_OPEN_DRAIN);
-  pinMode(PIN_SDA, INPUT);
-  for (int i = 0; i < 9; i++) {
-    digitalWrite(PIN_SCL, LOW);  delayMicroseconds(5);
-    digitalWrite(PIN_SCL, HIGH); delayMicroseconds(5);
-    if (digitalRead(PIN_SDA) == HIGH) break;
+// 맵을 모르는 동안에는 호출하지 말 것. 위 안전 주석 참고.
+static uint8_t tofWrite(uint16_t reg, const uint8_t *buf, size_t len) {
+  if (!buf || len == 0) return 0xFD;
+
+  Wire.beginTransmission(TOF_I2C_ADDR_7BIT);
+  Wire.write((uint8_t)(reg >> 8));
+  Wire.write((uint8_t)(reg & 0xFF));
+  for (size_t i = 0; i < len; i++) Wire.write(buf[i]);
+  return Wire.endTransmission(true);
+}
+
+static uint8_t tofRead8(uint16_t reg, uint8_t *out) {
+  return tofRead(reg, out, 1);
+}
+
+static uint8_t tofRead16(uint16_t reg, uint16_t *out) {
+  uint8_t b[2];
+  const uint8_t rc = tofRead(reg, b, 2);
+  if (rc == 0) *out = ((uint16_t)b[0] << 8) | b[1];   // big-endian 가정
+  return rc;
+}
+
+static const char *rcText(uint8_t rc) {
+  switch (rc) {
+    case 0:    return "성공";
+    case 2:    return "주소 NACK";
+    case 3:    return "데이터 NACK";
+    case 4:    return "버스 에러";
+    case 5:    return "타임아웃";
+    case 0xFE: return "길이 부족";
+    case 0xFD: return "인자 오류";
+    default:   return "기타";
   }
-  // STOP 컨디션: SCL HIGH 인 동안 SDA 를 LOW -> HIGH
-  pinMode(PIN_SDA, OUTPUT_OPEN_DRAIN);
-  digitalWrite(PIN_SDA, LOW);  delayMicroseconds(5);
-  digitalWrite(PIN_SCL, HIGH); delayMicroseconds(5);
-  digitalWrite(PIN_SDA, HIGH); delayMicroseconds(5);
-  pinMode(PIN_SDA, INPUT);
-  pinMode(PIN_SCL, INPUT);
+}
+
+static void enableSensor() {
+  if (PIN_XSHUT < 0) return;
+  pinMode(PIN_XSHUT, OUTPUT);
+  digitalWrite(PIN_XSHUT, LOW);
+  delay(10);
+  digitalWrite(PIN_XSHUT, HIGH);
+  delay(200);                       // 부팅 대기
 }
 
 // ---------------------------------------------------------------------------
-// [3][4] 주소 스윕. 0x08 ~ 0x77 (예약 주소 제외)
-//
-// endTransmission() 리턴 코드 집계가 핵심이다.
-//   전부 2 (addr NACK) -> 버스는 멀쩡한데 아무도 안 받는다 = 전기적 문제 아님
-//   전부 5 (timeout)   -> 버스가 죽었다 = 배선/풀업/전원 문제
+// [1] 존재 확인
 // ---------------------------------------------------------------------------
-static size_t scanBus(uint8_t *found, size_t maxFound) {
-  size_t n = 0;
-  uint16_t tally[8] = {0};
+static bool probe() {
+  Wire.beginTransmission(TOF_I2C_ADDR_7BIT);
+  const uint8_t rc = Wire.endTransmission(true);
+  Serial.printf("  0x%02X 주소 응답: %s (rc=%u)\n", TOF_I2C_ADDR_7BIT, rcText(rc), rc);
+  return rc == 0;
+}
 
-  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
-    Wire.beginTransmission(addr);
-    const uint8_t rc = Wire.endTransmission(true);
-    if (rc < 8) tally[rc]++;
-    if (rc == 0) {
-      Serial.printf("  [ACK] 7-bit 0x%02X   (8-bit  W=0x%02X  R=0x%02X)\n",
-                    addr, (uint8_t)(addr << 1), (uint8_t)((addr << 1) | 1));
-      if (n < maxFound) found[n++] = addr;
+// ---------------------------------------------------------------------------
+// [2] 다중 바이트 읽기가 주소 자동증가를 하는가
+//
+// 이게 안 되면 스윕 결과를 신뢰할 수 없다. 한 번에 4바이트 읽은 것과
+// 1바이트씩 4번 읽은 것을 비교한다.
+//   일치            -> 자동증가 O. 청크 스윕 유효
+//   전부 같은 값    -> 자동증가 X. 같은 레지스터를 4번 읽은 것
+// ---------------------------------------------------------------------------
+static bool checkAutoIncrement(uint16_t base) {
+  uint8_t blk[4], one[4];
+
+  uint8_t rc = tofRead(base, blk, 4);
+  if (rc != 0) {
+    Serial.printf("  블록 읽기 실패: %s\n", rcText(rc));
+    return false;
+  }
+  for (int i = 0; i < 4; i++) {
+    rc = tofRead8(base + i, &one[i]);
+    if (rc != 0) {
+      Serial.printf("  단일 읽기 실패 @0x%04X: %s\n", base + i, rcText(rc));
+      return false;
     }
   }
 
-  Serial.printf("  ACK %u | addr-NACK %u | data-NACK %u | bus-err %u | timeout %u\n",
-                (unsigned)tally[0], (unsigned)tally[2], (unsigned)tally[3],
-                (unsigned)tally[4], (unsigned)tally[5]);
-  if (n == 0) Serial.println(F("  (응답 없음)"));
-  return n;
+  Serial.printf("  블록 4B  @0x%04X: %02X %02X %02X %02X\n", base, blk[0], blk[1], blk[2], blk[3]);
+  Serial.printf("  단일 4회 @0x%04X: %02X %02X %02X %02X\n", base, one[0], one[1], one[2], one[3]);
+
+  const bool same = (memcmp(blk, one, 4) == 0);
+  const bool flat = (blk[0] == blk[1] && blk[1] == blk[2] && blk[2] == blk[3]);
+
+  if (same && !flat)      Serial.println(F("  -> 자동증가 동작. 청크 스윕 유효."));
+  else if (same && flat)  Serial.println(F("  -> 값이 전부 같아 판정 불가. 다른 주소에서 재시도 필요."));
+  else                    Serial.println(F("  -> !! 자동증가 안 함. 스윕은 1바이트씩 해야 한다."));
+  return same;
 }
 
-static void setXshut(bool enable) {
-  if (PIN_XSHUT < 0) {
-    Serial.println(F("  XSHUT 미정의 (-1). 건너뜀."));
-    return;
+// ---------------------------------------------------------------------------
+// [3] 전체 스윕. non-zero 만 출력한다.
+// ---------------------------------------------------------------------------
+static void sweep(uint32_t start, uint32_t end) {
+  uint8_t buf[CHUNK];
+  uint32_t nonZero = 0, rows = 0, printed = 0, errs = 0, consecErr = 0;
+  uint32_t firstNZ = 0xFFFFFFFF, lastNZ = 0;
+
+  for (uint32_t a = start; a <= end; a += CHUNK) {
+    const uint32_t remain = end - a + 1;
+    const size_t n = (remain < CHUNK) ? (size_t)remain : (size_t)CHUNK;
+
+    const uint8_t rc = tofRead((uint16_t)a, buf, n);
+    if (rc != 0) {
+      errs++;
+      if (++consecErr >= 64) {
+        Serial.printf("  0x%04lX 부터 연속 실패 64회. 스윕 중단.\n", (unsigned long)a);
+        break;
+      }
+      continue;
+    }
+    consecErr = 0;
+
+    bool any = false;
+    for (size_t i = 0; i < n; i++) {
+      if (buf[i]) {
+        any = true;
+        nonZero++;
+        if (a + i < firstNZ) firstNZ = a + i;
+        if (a + i > lastNZ)  lastNZ  = a + i;
+      }
+    }
+    if (!any) continue;
+
+    rows++;
+    if (printed < MAX_PRINT_ROWS) {
+      printed++;
+      Serial.printf("  0x%04lX: ", (unsigned long)a);
+      for (size_t i = 0; i < n; i++) Serial.printf("%02X ", buf[i]);
+      Serial.println();
+    }
   }
-  pinMode(PIN_XSHUT, OUTPUT);
-  digitalWrite(PIN_XSHUT, enable ? HIGH : LOW);
-  Serial.printf("  XSHUT (GPIO%d) = %s\n",
-                PIN_XSHUT, enable ? "HIGH (동작)" : "LOW (셧다운)");
+
+  if (rows > printed) Serial.printf("  ... non-zero 행 %lu개 더 있음 (출력 생략)\n",
+                                    (unsigned long)(rows - printed));
+  Serial.printf("  non-zero 바이트 %lu, 행 %lu, 읽기 실패 %lu\n",
+                (unsigned long)nonZero, (unsigned long)rows, (unsigned long)errs);
+  if (nonZero) Serial.printf("  non-zero 구간: 0x%04lX ~ 0x%04lX\n",
+                             (unsigned long)firstNZ, (unsigned long)lastNZ);
+  else         Serial.println(F("  전 구간 0x00. 레지스터 파일이 아직 초기화되지 않았을 수 있다"
+                                " (FW 다운로드 필요 가능성)."));
 }
 
-// 16-bit 주소 레지스터 읽기. 스코프로 45클럭 전체 트랜잭션을 보기 위한 용도.
-static bool readReg16(uint8_t devAddr, uint16_t reg, uint8_t *buf, size_t len) {
-  Wire.beginTransmission(devAddr);
-  Wire.write((uint8_t)(reg >> 8));
-  Wire.write((uint8_t)(reg & 0xFF));
-  if (Wire.endTransmission(false) != 0) return false;
+// ---------------------------------------------------------------------------
+// [4] 같은 구간을 두 번 읽어 값이 변하는 레지스터를 찾는다.
+//     변하는 게 있으면 레지스터 파일이 살아서 돌고 있다는 뜻이다.
+// ---------------------------------------------------------------------------
+static void checkLiveRegisters(uint32_t start, uint32_t end) {
+  uint8_t a1[CHUNK], a2[CHUNK];
+  uint32_t changed = 0, shown = 0;
 
-  if ((int)Wire.requestFrom((int)devAddr, (int)len, (int)true) != (int)len) return false;
-  for (size_t i = 0; i < len; i++) buf[i] = Wire.read();
-  return true;
+  for (uint32_t a = start; a <= end; a += CHUNK) {
+    const uint32_t remain = end - a + 1;
+    const size_t n = (remain < CHUNK) ? (size_t)remain : (size_t)CHUNK;
+
+    if (tofRead((uint16_t)a, a1, n) != 0) continue;
+    delay(20);
+    if (tofRead((uint16_t)a, a2, n) != 0) continue;
+
+    for (size_t i = 0; i < n; i++) {
+      if (a1[i] != a2[i]) {
+        changed++;
+        if (shown < 16) {
+          shown++;
+          Serial.printf("  0x%04lX: %02X -> %02X\n", (unsigned long)(a + i), a1[i], a2[i]);
+        }
+      }
+    }
+  }
+
+  if (changed) Serial.printf("  변하는 바이트 %lu개. 레지스터 파일이 살아 있다.\n",
+                             (unsigned long)changed);
+  else         Serial.println(F("  변하는 바이트 없음. 정적 상태."));
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(500);
 
-  banner("[1/4] I2C 라인 물리 상태 (Wire.begin 이전)");
-  const line_state_t sda = probeLine(PIN_SDA, "SDA");
-  const line_state_t scl = probeLine(PIN_SCL, "SCL");
-  if (sda == LINE_STUCK_LOW) recoverBus();
+  banner("VL53L9CX I2C 통신 + 레지스터 맵 탐색");
 
-  if (sda != LINE_OK || scl != LINE_OK) {
-    Serial.println(F("  *** 라인이 정상이 아니다. 아래 스캔 결과는 의미 없다. ***"));
-    Serial.println(F("      SDA/SCL 배선, GND 공통, J3 점퍼(3V3 쪽) 부터 확인할 것."));
-  }
-
+  enableSensor();
   Wire.begin(PIN_SDA, PIN_SCL, I2C_FREQ_HZ);
-  Wire.setTimeOut(20);
-  Serial.printf("\n  I2C %lu Hz, SDA=GPIO%d, SCL=GPIO%d\n",
-                (unsigned long)I2C_FREQ_HZ, PIN_SDA, PIN_SCL);
+  Wire.setTimeOut(50);
+  Serial.printf("  I2C %lu Hz, SDA=GPIO%d, SCL=GPIO%d, XSHUT=GPIO%d\n",
+                (unsigned long)I2C_FREQ_HZ, PIN_SDA, PIN_SCL, PIN_XSHUT);
 
-  banner("[2/4] XSHUT = LOW 스캔 (센서 셧다운)");
-  setXshut(false);
-  delay(50);
-  uint8_t base[MAX_FOUND];
-  const size_t baseCount = scanBus(base, MAX_FOUND);
-
-  banner("[3/4] XSHUT = HIGH 스캔 (센서 동작)");
-  setXshut(true);
-  delay(200);                       // 부팅 대기
-  g_foundCount = scanBus(g_found, MAX_FOUND);
-
-  banner("[4/4] 판정");
-  bool newDevice = false;
-  for (size_t i = 0; i < g_foundCount; i++) {
-    bool wasThere = false;
-    for (size_t j = 0; j < baseCount; j++) {
-      if (base[j] == g_found[i]) { wasThere = true; break; }
-    }
-    if (!wasThere) {
-      Serial.printf("  >>> XSHUT HIGH 에서만 나타난 주소: 0x%02X  <-- ToF 센서\n",
-                    g_found[i]);
-      newDevice = true;
-    }
+  banner("[1/4] 존재 확인");
+  if (!probe()) {
+    Serial.println(F("  센서가 응답하지 않는다. 아래 단계는 의미 없다."));
+    Serial.println(F("  R25 가 제거되어 Y1(12MHz) 이 동작하는지, R24 가 장착됐는지 확인할 것."));
+    return;
   }
 
-  if (g_foundCount == 0) {
-    Serial.println(F("  아무것도 ACK 하지 않음."));
-    Serial.println(F("   -> 보드 레벨 문제. GND 공통 누락, J3 점퍼가 1V8 쪽,"));
-    Serial.println(F("      레벨시프터(U1/U2) 전원/OE 를 의심."));
-  } else if (!newDevice) {
-    Serial.println(F("  응답은 있으나 XSHUT 로 변하는 장치가 없다."));
-    Serial.println(F("   -> 버스/전원/레벨시프터는 정상. 센서만 안 깨어난다."));
-    Serial.println(F("      XSHUT 배선(GPIO32 <-> J2), 센서측 1V8/2V8 레일,"));
-    Serial.println(F("      또는 I2C/SPI 인터페이스 선택 스트랩을 확인할 것."));
-  }
+  banner("[2/4] 다중 바이트 읽기 주소 자동증가 확인");
+  checkAutoIncrement(0x0000);
 
-  bool seenTof = false, seenEep = false;
-  for (size_t i = 0; i < g_foundCount; i++) {
-    if (g_found[i] == TOF_I2C_ADDR_7BIT)    seenTof = true;
-    if (g_found[i] == EEPROM_I2C_ADDR_7BIT) seenEep = true;
-  }
-  Serial.printf("  기대 주소 점검:  ToF 0x%02X = %s   EEPROM 0x%02X = %s\n",
-                TOF_I2C_ADDR_7BIT,    seenTof ? "응답 O" : "응답 X",
-                EEPROM_I2C_ADDR_7BIT, seenEep ? "응답 O" : "응답 X");
+  banner("[3/4] 레지스터 스윕 (non-zero 만 출력)");
+  Serial.printf("  범위 0x%04lX ~ 0x%04lX, %d 바이트씩\n",
+                (unsigned long)SWEEP_START, (unsigned long)SWEEP_END, CHUNK);
+  sweep(SWEEP_START, SWEEP_END);
 
-  banner("루프 진입 (3초마다 재스캔)");
+  banner("[4/4] 값이 변하는 레지스터 탐색");
+  checkLiveRegisters(0x0000, 0x0FFF);
+
+  banner("탐색 완료 - 루프 진입");
 }
 
 void loop() {
-  delay(3000);
+  delay(5000);
 
-  g_foundCount = scanBus(g_found, MAX_FOUND);
+  uint8_t rc = 0;
+  uint16_t v = 0;
+  rc = tofRead16(0x0000, &v);
+  Serial.printf("[생존 확인] 0x0000 = 0x%04X (%s)\n", v, rcText(rc));
 
-  // 응답한 주소가 있으면 실제 레지스터 읽기까지 해본다 (스코프로 45클럭 확인용).
-  for (size_t i = 0; i < g_foundCount; i++) {
-    uint8_t data = 0;
-    if (readReg16(g_found[i], 0x010F, &data, 1)) {
-      Serial.printf("  0x%02X  reg 0x010F = 0x%02X\n", g_found[i], data);
-    } else {
-      Serial.printf("  0x%02X  ACK 는 하는데 reg 0x010F 읽기 실패\n", g_found[i]);
-    }
-  }
-  Serial.println(F("---------------------------------------------------"));
+  (void)tofWrite;   // API 로만 제공. 맵 확정 전까지 호출하지 않는다.
 }
