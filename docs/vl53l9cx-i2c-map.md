@@ -455,6 +455,35 @@ frame 12x10   error_code=0x0903  error_status=0xC0
 - 설정 도달: 메타데이터의 `frame 12x10` 이 우리가 설정한 binning 8 과 일치
 - 파이프라인: 프레임 카운터 증가
 
+#### 테스트 포인트 맵 (레벨시프터 시트)
+
+TP 는 1~6 이 전부이고 **모두 신호용이다. 전원 TP 는 없다.**
+전부 레벨시프터 B측(센서측, 1.8V)에 붙어 있다.
+
+| TP | 신호 | 위치 |
+|---|---|---|
+| TP1 | SENSOR_SDA | U1 B1 (pin 13) |
+| TP2 | SENSOR_SCL | U1 B2 (pin 12) |
+| TP3 | SENSOR_SYNC_IN | U1 B3 (pin 11). 이 프로젝트는 미사용 |
+| TP4 | SENSOR_XSHUT | U1 B4 (pin 10) |
+| TP5 | **SENSOR_AP_CLK** | U2 B1 (pin 13) |
+| TP6 | SENSOR_INTR | U2 B2 (pin 12) |
+
+레벨시프터는 U1(SDA/SCL/SYNC_IN/XSHUT)과 U2(AP_CLK/INTR) 두 개이고, 둘 다
+PI4ULS3V204 다. VCCA = HOST_IOVDD, VCCB = P1V8.
+
+`LS_ENABLE`(EN, pin 8)은 R9 47k 로 HOST_IOVDD 에 풀업되어 있어 기본 활성이다.
+호스트측 풀업 R7/R8 = 2.2k 도 이 시트에 있다.
+
+쓸모 있는 지점 두 개:
+
+- **TP5** — 센서 코앞의 AP_CLK. 12MHz 가 실제로 들어가는지 스코프로 직접 확인
+- **TP6** — SENSOR_INTR. `FRAME_SIGNALING_MODE` 가 인터럽트 패드 모드이므로
+  프레임 완료 시 펄스가 나와야 한다. CSI 테스트에서 프레임 카운터가 0->1 로
+  올라갔으니 그때 여기에 펄스가 있었는지 확인할 수 있다
+
+**전원 TP 가 없으므로 VBAT_LDD 확인은 C6/C7 에서 해야 한다.**
+
 #### 확인할 하드웨어 — VBAT_LDD
 
 스키매틱 NOTE 기준 센서 전원은 다음과 같다.
